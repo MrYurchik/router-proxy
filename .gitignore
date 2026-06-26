@@ -14,6 +14,17 @@ __pycache__/
 venv/
 env/
 
+# Testing & quality
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.coverage
+htmlcov/
+
+# Build artifacts
+dist/
+build/
+
 # IDE
 .idea/
 *.iml
@@ -23,8 +34,17 @@ env/
 .DS_Store
 Thumbs.db
 
-# Systemd service
+# Systemd service (user-specific, not committed)
 *.service
 
 # Routing config (symlinked or local copy — use env var ROUTING_CONFIG)
 hermes-routing.yaml
+
+# Documentation build (if using mkdocs/docsify)
+site/
+_site/
+
+# Editor tmp files
+*.swp
+*.swo
+*~
