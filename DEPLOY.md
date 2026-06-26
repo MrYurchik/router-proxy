@@ -260,12 +260,18 @@ curl http://localhost:8787/admin/state
 ```
 
 Check `go_healthy` field. If `false`, the Go backend will be skipped for all
-requests until the daily health check or a manual fix.
+requests until the daily health check restores it.
 
-Force Go recovery:
+The health check runs automatically on the daily schedule and on every proxied request. To force a health re-check immediately, restart the service:
 
 ```bash
-curl -X POST http://localhost:8787/admin/reload
+systemctl --user restart hermes-routing-proxy
+```
+
+To manually reset the health state in SQLite:
+
+```bash
+sqlite3 ~/.hermes/proxy_state.db "UPDATE state SET value='true' WHERE key='go_healthy'"
 ```
 
 ### Reload configuration without restart

@@ -41,7 +41,7 @@ persistent state tracking.
 ## 1. Tiered Routing Ladder
 
 When a request arrives, the proxy builds a **fallback ladder** from the
-[YAML routing configuration](./SETUP.md) and walks through it until one tier
+[YAML routing configuration](../hermes-routing.yaml) and walks through it until one tier
 succeeds:
 
 | Tier | Provider | Cost Profile | Description |

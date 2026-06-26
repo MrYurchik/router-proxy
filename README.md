@@ -14,8 +14,8 @@ Telegram when the Go subscription goes down.
 ```bash
 cd where/this/repo/is/router_proxy
 
-# Install
-pip install -r requirements.txt
+# Install dependencies (use `uv` — the system Python has PEP 668)
+uv pip install -r requirements.txt
 
 # Set env vars (copy .env.example → .env, fill keys)
 export GO_API_KEY="sk-..."
