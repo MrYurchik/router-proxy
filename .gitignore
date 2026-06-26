@@ -1,0 +1,30 @@
+# Hermes Routing Proxy — .gitignore
+
+# Environment & secrets
+.env
+.env.local
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Systemd service
+*.service
+
+# Routing config (symlinked or local copy — use env var ROUTING_CONFIG)
+hermes-routing.yaml
