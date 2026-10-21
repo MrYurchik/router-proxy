@@ -1,8 +1,29 @@
 """
 router_proxy/config.py — Load and validate hermes-routing.yaml
 
-All model slugs / tiers / settings come from the YAML file.
+All model slugs / roles / providers come from the YAML file.
 No hardcoded model IDs — the config file is the single source of truth.
+
+Config structure:
+  default_role: str
+  unknown_role_policy: str  # "error" or "fallback"
+  unknown_role_fallback: str  # role name to fallback to
+  role_aliases: dict[str, str]  # e.g. dispatcher -> orchestrator
+  go: Go config
+  go_backed_roles: list[str]  # Roles that use OpenCode Go
+  roles:
+    <rolename>:
+      primary: {provider, models}     # orchestrator: OpenRouter FREE
+      fallback: {provider, models}    # orchestrator: Go fallback
+      provider: opencode-go           # Go-only roles
+      default: [models...]            # default tier
+      premium: [models...]            # premium tier (complex=true or failures>=2)
+  direct_model_passthrough:
+    enabled: true
+    policy: explicit_only
+    always_allow: [...]
+    manual_allow: {provider_prefixes: [...], require_header: {name, value}}
+    deny_by_default: true
 """
 
 from pathlib import Path
@@ -10,10 +31,13 @@ import yaml
 import os
 from typing import Any
 
-CONFIG_PATH = os.environ.get("ROUTING_CONFIG", str(Path(__file__).parent.parent / "hermes-routing.yaml"))
+CONFIG_PATH = os.environ.get("ROUTING_CONFIG", str(Path(__file__).parent / "hermes-routing.yaml"))
 
 _config: dict[str, Any] = {}
 _config_mtime: float = 0.0
+
+# Failures threshold before escalating to premium tier
+ESCALATE_THRESHOLD = 2  # same for all roles
 
 
 def load_config(path: str | None = None, force_reload: bool = False) -> dict[str, Any]:
@@ -41,116 +65,185 @@ def _validate(cfg: dict):
     assert "go" in cfg, "Missing 'go' section"
     assert "roles" in cfg, "Missing 'roles' section"
     assert "go_backed_roles" in cfg, "Missing 'go_backed_roles'"
-    assert "escalate_to_premium_after_failures" in cfg, "Missing 'escalate_to_premium_after_failures'"
     for role in cfg["roles"]:
         r = cfg["roles"][role]
-        # Every role must have at least one model slot
-        has_model = any(
-            k for k in r
-            if k.startswith("go_") or k.startswith("fallback_") or
-               k.startswith("escalation_") or k.startswith("free_") or
-               k in ("primary", "cheap_alt")
-        )
-        assert has_model, f"Role '{role}' has no model slots"
+        # Every role must have either:
+        # a) primary + fallback (orchestrator pattern), or
+        # b) provider + default/premium (go-only pattern)
+        has_orchestrator = all(k in r for k in ["primary", "fallback"])
+        has_go_only = "provider" in r or "default" in r
+        if not has_orchestrator and not has_go_only:
+            assert False, f"Role '{role}' has no valid config structure. Must have 'primary'/'fallback' or 'provider'"
+
+    # Validate role_aliases if present
+    aliases = cfg.get("role_aliases", {})
+    if aliases:
+        assert isinstance(aliases, dict), "'role_aliases' must be a dict"
+
+    # Validate direct_model_passthrough if present
+    direct_cfg = cfg.get("direct_model_passthrough")
+    if direct_cfg:
+        assert isinstance(direct_cfg, dict), "'direct_model_passthrough' must be a dict"
 
 
 def get_go_config() -> dict:
-    """Return the 'go' block from the config."""
     cfg = load_config()
-    return cfg["go"]
+    return cfg.get("go", {})
 
 
 def get_roles_config() -> dict:
-    """Return the 'roles' block from the config."""
     cfg = load_config()
-    return cfg["roles"]
+    return cfg.get("roles", {})
 
 
-def get_go_backed_roles() -> list[str]:
-    """Roles that can use the Go backend."""
+def get_role_aliases() -> dict:
     cfg = load_config()
-    return cfg["go_backed_roles"]
+    return cfg.get("role_aliases", {})
 
 
-def get_escalation_threshold() -> int:
-    """How many failures before escalating to $5-cap tier."""
+def get_go_backed_roles() -> set[str]:
     cfg = load_config()
-    return cfg["escalate_to_premium_after_failures"]
+    return set(cfg.get("go_backed_roles", []))
 
 
-def get_role_tiers(role: str, complex_flag: bool, failure_count: int) -> list[dict]:
+def get_direct_model_config() -> dict:
+    cfg = load_config()
+    return cfg.get("direct_model_passthrough", {
+        "enabled": True,
+        "policy": "explicit_only",
+        "always_allow": [],
+        "manual_allow": {
+            "provider_prefixes": ["openrouter/"],
+            "require_header": {"name": "X-Manual-Model-Override", "value": "true"}
+        },
+        "deny_by_default": True
+    })
+
+
+def get_unknown_role_policy() -> str:
+    cfg = load_config()
+    return cfg.get("unknown_role_policy", "error")
+
+
+def get_unknown_role_fallback() -> str:
+    cfg = load_config()
+    return cfg.get("unknown_role_fallback", "simple_tasks")
+
+
+def get_default_role() -> str:
+    cfg = load_config()
+    return cfg.get("default_role", "orchestrator")
+
+
+def is_logical_role(model: str) -> bool:
+    """Check if model is a logical role name (orchestrator, coder, etc.)."""
+    roles_config = get_roles_config()
+    aliases = get_role_aliases()
+    return model in roles_config or model in aliases
+
+
+def get_role_tiers(role: str, complex_flag: bool, failure_count: int, original_model: str | None = None) -> list[dict]:
     """
     Build the ordered fallback ladder for a role.
 
     Returns a list of dicts:
-      [{"name": "go_default", "provider": "go", "model": "opencode-go/deepseek-v4-flash", "tier": 0}, ...]
+      [{"name": "go_default", "provider": "go", "model": "deepseek-v4-flash", "tier": 0}, ...]
 
     Each entry has:
       - provider: "go" or "openrouter"
-      - model: real slug to use
+      - model: model slug to use
       - tier: tier number for logging
+      - name: descriptive name
+      - fallback_reason: reason for this tier
+      - role_source: "role_routing" | "alias" | "unknown_fallback"
+      - resolved_role: the actual role being used (for alias/fallback tracking)
     """
     cfg = load_config()
     roles = cfg["roles"]
-    escalate_threshold = cfg["escalate_to_premium_after_failures"]
-    go_backed = set(cfg["go_backed_roles"])
+    go_prefix = cfg["go"].get("model_prefix", "opencode-go/")
+    go_backed = set(cfg.get("go_backed_roles", []))
 
     r = roles.get(role)
+    resolved_role = role
+    role_source = "role_routing"
+
+    # Track original model for audit
+    if original_model is None:
+        original_model = role
+
     if not r:
-        raise ValueError(f"Unknown role: {role}")
+        # Check if there's an alias
+        aliases = get_role_aliases()
+        if role in aliases:
+            target = aliases[role]
+            r = roles.get(target)
+            if not r:
+                raise ValueError(f"Alias '{role}' -> '{target}' but target role not found")
+            resolved_role = target
+            role_source = "alias"
+        if not r:
+            raise ValueError(f"Unknown role: {role}")
 
     tiers: list[dict] = []
-    uses_go = role in go_backed
+    uses_go = resolved_role in go_backed
 
-    # ── Tier 0: Go (only for go_backed roles) ──
-    if uses_go:
-        go_prefix = cfg["go"].get("model_prefix", "opencode-go/")
+    # ── Pattern A: orchestrator (primary + fallback) ──
+    if "primary" in r and "fallback" in r:
+        # Primary tier (usually OpenRouter FREE)
+        primary = r["primary"]
+        for i, model in enumerate(primary.get("models", [])):
+            provider_prefix = primary["provider"]
+            tiers.append({
+                "name": f"primary_{i}",
+                "provider": provider_prefix,
+                "model": model,
+                "tier": 0 + (i * 0.1),
+                "fallback_reason": "primary",
+                "role_source": role_source,
+                "resolved_role": resolved_role,
+            })
 
-        if complex_flag or failure_count >= 1:
-            # Use premium if available, else default
-            go_slot = r.get("go_premium") or r.get("go_default") or r.get("go_primary")
-        else:
-            go_slot = r.get("go_default") or r.get("go_premium") or r.get("go_primary")
+        # Fallback tier
+        fallback = r["fallback"]
+        for i, model in enumerate(fallback.get("models", [])):
+            provider_name = fallback["provider"]
+            is_first = i == 0
+            tiers.append({
+                "name": f"fallback_{i}",
+                "provider": provider_name,
+                "model": go_prefix + model if provider_name == "go" else model,
+                "tier": 1 + (i * 0.1),
+                "fallback_reason": "fallback" if is_first else "fallback_alt",
+                "role_source": role_source,
+                "resolved_role": resolved_role,
+            })
+    # ── Pattern B: go-only roles (default + premium) ──
+    elif uses_go:
+        # Default tier
+        for i, model in enumerate(r.get("default", [])):
+            tiers.append({
+                "name": f"default_{i}",
+                "provider": "go",
+                "model": go_prefix + model,
+                "tier": 0 + (i * 0.1),
+                "fallback_reason": "default",
+                "role_source": role_source,
+                "resolved_role": resolved_role,
+            })
 
-        if go_slot:
-            models = go_slot if isinstance(go_slot, list) else [go_slot]
-            for m in models:
-                tiers.append({"name": "go", "provider": "go", "model": m, "tier": 0})
-
-    # ── Tier 1: OpenRouter $2-cap ──
-    if complex_flag:
-        fallback = r.get("fallback_2cap_heavy") or r.get("fallback_2cap")
+        # Premium tier (if complex or failures >= 2)
+        if complex_flag or failure_count >= ESCALATE_THRESHOLD:
+            for i, model in enumerate(r.get("premium", [])):
+                tiers.append({
+                    "name": f"premium_{i}",
+                    "provider": "go",
+                    "model": go_prefix + model,
+                    "tier": 1.5 + (i * 0.1),
+                    "fallback_reason": "premium" if complex_flag else "escalation",
+                    "role_source": role_source,
+                    "resolved_role": resolved_role,
+                })
     else:
-        fallback = r.get("fallback_2cap_default") or r.get("fallback_2cap") or r.get("primary") or r.get("fallback_cheap")
-
-    # For roles without Go-backed fallback: use primary/cheap_alt
-    if not fallback and not uses_go:
-        fallback = r.get("primary")
-
-    if fallback == "none":
-        fallback = None
-
-    if fallback:
-        models = fallback if isinstance(fallback, list) else [fallback]
-        for m in models:
-            tiers.append({"name": "2cap", "provider": "openrouter", "model": m, "tier": 1})
-
-    # ── Tier 1b: $5-cap escalation (only when failure_count ≥ threshold) ──
-    # tool_use/simple_tasks skip this (per YAML they don't have escalation keys)
-    if failure_count >= escalate_threshold:
-        esc = r.get("escalation_5cap")
-        if esc:
-            models = esc if isinstance(esc, list) else [esc]
-            # Clamp to failure_count index
-            idx = min(failure_count - escalate_threshold, len(models) - 1)
-            tiers.append({"name": "5cap_escalation", "provider": "openrouter", "model": models[idx], "tier": 1.5})
-
-    # ── Tier 2: Free models ──
-    free = (r.get("free_active") or r.get("free_long_context") or
-            r.get("free_backup") or r.get("cheap_alt"))
-    if free:
-        models = free if isinstance(free, list) else [free]
-        for m in models:
-            tiers.append({"name": "free", "provider": "openrouter", "model": m, "tier": 2})
+        raise ValueError(f"Role '{role}' has unsupported config structure")
 
     return tiers

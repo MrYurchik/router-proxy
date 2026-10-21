@@ -11,6 +11,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
 import httpx
 import uvicorn
@@ -160,6 +161,14 @@ def _tier_label(tier: float) -> str:
 
 # ── Main endpoint ──
 
+@dataclass
+class RoutingContext:
+    """Track original model and resolved roles for audit logging."""
+    original_model: str
+    resolved_role: str = ""
+    role_source: str = "model"
+    fallback_reason: str = ""
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """OpenAI-compatible chat completions with role-based routing."""
@@ -167,33 +176,54 @@ async def chat_completions(request: Request):
 
     # Determine role/model
     model_field = body.get("model", "")
-    if "/" in model_field:
-        role = "passthrough"
-    else:
-        role = model_field.lower()
+
+    # Track original model for audit logging
+    routing_ctx = RoutingContext(original_model=model_field)
+
+    # Extract all X-* headers for routing
+    headers = {k: v for k, v in request.headers.items() if k.lower().startswith("x-")}
+
+    # The router now handles both logical roles and direct model slugs
+    role = model_field  # Pass as-is, router will detect type
 
     subtask_id, failure_count, complex_flag = _extract_routing_meta(request, body)
     stream = body.get("stream", False)
 
     try:
+        # Pass original model to router for alias/fallback tracking
+        # Don't resolve aliases here - let router do it
         result = await rt.route_and_call(
             role=role, body=body, subtask_id=subtask_id,
             failure_count=failure_count, complex_flag=complex_flag, stream=stream,
+            headers=headers,  # Pass headers for manual override detection
+            original_model=routing_ctx.original_model,
         )
     except ValueError:
-        # Unknown role — try default_role if set
-        default_role = cfg.load_config().get("default_role", "")
-        if default_role and role != default_role:
-            logger.info(f"Unknown role '{role}', falling back to default_role='{default_role}'")
-            role = default_role
+        # Unknown role — apply unknown_role_policy
+        unknown_policy = cfg.get_unknown_role_policy()
+        unknown_fallback = cfg.get_unknown_role_fallback()
+
+        if unknown_policy == "error":
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"message": f"Unknown role: '{role}' — configure the role in hermes-routing.yaml or set unknown_role_policy to 'fallback'", "type": "invalid_request_error"}},
+            )
+        elif unknown_policy == "fallback":
+            logger.info(f"Unknown role '{role}', falling back to '{unknown_fallback}' per unknown_role_policy")
+            routing_ctx.resolved_role = unknown_fallback
+            routing_ctx.role_source = "unknown_fallback"
+            routing_ctx.fallback_reason = "unknown_role_to_simple_tasks"
+            role = unknown_fallback
             result = await rt.route_and_call(
                 role=role, body=body, subtask_id=subtask_id,
                 failure_count=failure_count, complex_flag=complex_flag, stream=stream,
+                headers=headers,
+                original_model=routing_ctx.original_model,
             )
         else:
             return JSONResponse(
                 status_code=400,
-                content={"error": {"message": f"Unknown role: '{role}' and no default_role configured", "type": "invalid_request_error"}},
+                content={"error": {"message": f"Unknown role: '{role}' and unknown_role_policy='{unknown_policy}' is invalid", "type": "invalid_request_error"}},
             )
 
     if "error" in result:
@@ -209,19 +239,29 @@ async def chat_completions(request: Request):
     tier = result.get("tier", -1)
     tier_str = _tier_label(tier)
 
-    # Build routing info
+    # Use resolved role from router for audit logging
+    fallback_reason = result.get("fallback_reason", routing_ctx.fallback_reason)
+    role_source = result.get("role_source", routing_ctx.role_source)
+    requested_model = result.get("requested_model", routing_ctx.original_model)
+    resolved_role = result.get("resolved_role", routing_ctx.resolved_role or role)
+    log_role = resolved_role if resolved_role and resolved_role != role else role
+
+    # Build routing info (shows what was actually used)
     routing_info = {
-        "role": role,
+        "role": log_role,
         "model": real_model,
         "backend": backend,
         "tier": tier_str,
     }
 
-    # Persist routing log
+    # Persist routing log with enhanced fields
+    assert isinstance(result, dict), "route_and_call must return dict at this point"
     state.log_routing(
-        subtask_id=subtask_id, role=role, model=real_model,
+        subtask_id=subtask_id, role=log_role, model=real_model,
         backend=backend, tier=tier, status=status_code,
         complex_flag=complex_flag, failure_count=failure_count,
+        role_source=role_source, fallback_reason=fallback_reason,
+        requested_model=requested_model, resolved_role=resolved_role,
     )
 
     logger.info(
